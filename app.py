@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image
+from pymongo import MongoClient
 
 load_dotenv()
 
@@ -20,13 +21,18 @@ BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_URL = os.getenv("DATABASEURL")
 
 # Configuration
-STATE_FILE = "deletion_state.json"
-DECISIONS_FILE = "deletion_decisions.json"
 MAX_TWEETS_PER_RUN = 10  # Basic tier: 5 deletes per 15 mins, analyze more than we delete
 DELAY_BETWEEN_DELETES = 2
 PRE_2019_CUTOFF = datetime(2019, 1, 1, tzinfo=timezone.utc)
+
+# MongoDB Setup
+mongo_client = MongoClient(DATABASE_URL)
+db = mongo_client.get_default_database()
+state_collection = db["state"]
+decisions_collection = db["decisions"]
 
 # Initialize OpenAI
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -147,54 +153,44 @@ Analyze carefully and respond in JSON format:
 
 
 class StateManager:
-    """Manages state and decision logging"""
+    """Manages state and decision logging using MongoDB"""
 
     def __init__(self):
+        self.state_collection = state_collection
+        self.decisions_collection = decisions_collection
         self.state = self.load_state()
-        self.decisions = self.load_decisions()
 
     def load_state(self):
-        """Load state from file"""
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
+        """Load state from MongoDB"""
+        state_doc = self.state_collection.find_one({"_id": "app_state"})
+        if state_doc:
+            return state_doc
         return {
+            "_id": "app_state",
             "total_deleted": 0,
             "total_kept": 0,
             "total_analyzed": 0,
             "last_run": None,
-            "last_analyzed_tweet_id": None
-        }
-
-    def load_decisions(self):
-        """Load decision log from file"""
-        if os.path.exists(DECISIONS_FILE):
-            with open(DECISIONS_FILE, 'r') as f:
-                return json.load(f)
-        return {
-            "decisions": [],
-            "stats": {
-                "total_analyzed": 0,
-                "marked_for_deletion": 0,
-                "actually_deleted": 0,
-                "kept": 0
-            }
+            "last_analyzed_tweet_id": None,
+            "pagination_token": None
         }
 
     def save_state(self):
-        """Save state to file"""
+        """Save state to MongoDB"""
         self.state["last_run"] = datetime.now().isoformat()
-        with open(STATE_FILE, 'w') as f:
-            json.dump(self.state, f, indent=2)
+        self.state_collection.replace_one(
+            {"_id": "app_state"},
+            self.state,
+            upsert=True
+        )
 
-    def save_decisions(self):
-        """Save decisions to file"""
-        with open(DECISIONS_FILE, 'w') as f:
-            json.dump(self.decisions, f, indent=2)
+    def update_pagination_token(self, token):
+        """Update pagination token in state"""
+        self.state["pagination_token"] = token
 
     def log_decision(self, tweet, decision, reason, ai_analysis, deleted=False):
-        """Log a decision"""
-        self.decisions["decisions"].append({
+        """Log a decision to MongoDB"""
+        decision_doc = {
             "tweet_id": str(tweet.id),
             "text": tweet.full_text[:200],  # Truncate long tweets
             "created_at": tweet.created_at.isoformat(),
@@ -206,18 +202,14 @@ class StateManager:
             "is_reply": bool(tweet.in_reply_to_status_id),
             "is_retweet": hasattr(tweet, 'retweeted_status'),
             "deleted": deleted,
-            "deleted_at": datetime.now().isoformat() if deleted else None
-        })
+            "deleted_at": datetime.now().isoformat() if deleted else None,
+            "analyzed_at": datetime.now().isoformat()
+        }
 
-        # Update stats
-        self.decisions["stats"]["total_analyzed"] += 1
-        if decision == "DELETE":
-            self.decisions["stats"]["marked_for_deletion"] += 1
-            if deleted:
-                self.decisions["stats"]["actually_deleted"] += 1
-        else:
-            self.decisions["stats"]["kept"] += 1
+        # Insert decision into MongoDB
+        self.decisions_collection.insert_one(decision_doc)
 
+        # Update stats in state
         self.state["total_analyzed"] += 1
         if deleted:
             self.state["total_deleted"] += 1
@@ -233,8 +225,8 @@ class StateManager:
         return False
 
     def was_analyzed(self, tweet_id):
-        """Check if tweet was already analyzed"""
-        return any(d['tweet_id'] == str(tweet_id) for d in self.decisions["decisions"])
+        """Check if tweet was already analyzed in MongoDB"""
+        return self.decisions_collection.find_one({"tweet_id": str(tweet_id)}) is not None
 
 
 class DeletionDecider:
@@ -338,22 +330,39 @@ class TweetDeleter:
         print(f"   Deleted: {self.state_manager.state['total_deleted']}")
         print(f"   Kept: {self.state_manager.state['total_kept']}")
 
-        print(f"\n📥 Fetching up to {limit} tweets...")
+        # Get pagination token from state
+        pagination_token = self.state_manager.state.get("pagination_token")
+
+        if pagination_token:
+            print(f"\n📥 Fetching up to {limit} tweets (continuing from previous run)...")
+        else:
+            print(f"\n📥 Fetching up to {limit} tweets (starting from newest)...")
 
         try:
-            # Fetch tweets using v2 API (newest first)
+            # Fetch tweets using v2 API with pagination
             # v2 API requires min 5, max 100 results per request
             max_results = max(5, min(limit, 100))
-            response = self.client.get_users_tweets(
-                id=self.my_user_id,
-                max_results=max_results,
-                tweet_fields=['created_at', 'text', 'attachments', 'referenced_tweets', 'in_reply_to_user_id'],
-                expansions=['attachments.media_keys'],
-                media_fields=['type', 'url', 'preview_image_url']
-            )
+
+            # Build request parameters
+            request_params = {
+                "id": self.my_user_id,
+                "max_results": max_results,
+                "tweet_fields": ['created_at', 'text', 'attachments', 'referenced_tweets', 'in_reply_to_user_id'],
+                "expansions": ['attachments.media_keys'],
+                "media_fields": ['type', 'url', 'preview_image_url']
+            }
+
+            # Add pagination token if we have one
+            if pagination_token:
+                request_params["pagination_token"] = pagination_token
+
+            response = self.client.get_users_tweets(**request_params)
 
             if not response.data:
                 print("✅ No more tweets to process!")
+                # Reset pagination token since we've reached the end
+                self.state_manager.update_pagination_token(None)
+                self.state_manager.save_state()
                 return
 
             tweets = response.data
@@ -427,13 +436,22 @@ class TweetDeleter:
                 print(f"   Actually deleted: {deleted_count}")
             print("="*60)
 
+            # Update pagination token for next run
+            if response.meta and 'next_token' in response.meta:
+                next_token = response.meta['next_token']
+                self.state_manager.update_pagination_token(next_token)
+                print(f"\n📄 Pagination token saved - will continue from here next run")
+            else:
+                # No more pages, reset token
+                self.state_manager.update_pagination_token(None)
+                print(f"\n🏁 Reached end of tweets - will start from newest on next run")
+
         except tweepy.errors.TweepyException as e:
             print(f"❌ Twitter API Error: {e}")
         finally:
-            # Save state
+            # Save state to MongoDB
             self.state_manager.save_state()
-            self.state_manager.save_decisions()
-            print(f"\n💾 Progress saved to {STATE_FILE} and {DECISIONS_FILE}")
+            print(f"\n💾 Progress saved to MongoDB")
 
     def _adapt_v2_tweet(self, tweet_v2, media_dict):
         """Convert v2 tweet format to v1-like structure for compatibility"""
@@ -484,12 +502,26 @@ def main():
         default=MAX_TWEETS_PER_RUN,
         help=f'Number of tweets to process (default: {MAX_TWEETS_PER_RUN})'
     )
+    parser.add_argument(
+        '--reset-pagination',
+        action='store_true',
+        help='Reset pagination and start from newest tweets'
+    )
 
     args = parser.parse_args()
 
     if not OPENAI_API_KEY:
         print("❌ Error: OPENAI_API_KEY not found in .env file")
         return
+
+    # Reset pagination if requested
+    if args.reset_pagination:
+        state_collection.update_one(
+            {"_id": "app_state"},
+            {"$set": {"pagination_token": None}},
+            upsert=True
+        )
+        print("✅ Pagination reset - will start from newest tweets\n")
 
     if not args.execute:
         print("\n⚠️  DRY RUN MODE - No tweets will be deleted")
@@ -502,7 +534,7 @@ def main():
     if args.execute:
         print("✨ Done! Run again to process more tweets.")
     else:
-        print("✨ Dry run complete! Review decisions in deletion_decisions.json")
+        print("✨ Dry run complete! Review decisions in MongoDB")
         print("   Run with --execute to actually delete tweets")
     print("="*60)
 

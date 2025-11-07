@@ -149,3 +149,36 @@ This allows the script to resume where it left off, even across multiple runs or
 ## License
 
 Personal use script for @dannypostmaa
+
+
+
+Twitter API v2 Endpoints:
+
+  1. GET /2/users/me (app.py:308)
+
+  - Purpose: Get authenticated user's information
+  - Used for: Getting your user ID and username
+  - Called: Once at startup
+  - Rate limit: 75 requests per 15 minutes
+
+  2. GET /2/users/:id/tweets (app.py:334-340)
+
+  - Purpose: Fetch user's tweets
+  - Used for: Getting your recent tweets to analyze
+  - Parameters:
+    - max_results: 5-100 tweets per request
+    - tweet_fields: created_at, text, attachments, referenced_tweets, in_reply_to_user_id
+    - expansions: attachments.media_keys
+    - media_fields: type, url, preview_image_url
+  - Called: Every time the script runs
+  - Rate limit: 1,500 requests per 15 minutes (Free tier: 10,000 tweets/month)
+
+  Twitter API v1.1 Endpoint:
+
+  3. POST /1.1/statuses/destroy/:id (app.py:382)
+
+  - Purpose: Delete a tweet
+  - Used for: Actually deleting tweets (only when --execute flag is used)
+  - Called: For each tweet marked for deletion
+  - Rate limit: No documented rate limit, but you have a 2-second delay between deletes
+  - Note: V2 doesn't have a delete endpoint yet, so v1.1 is required
