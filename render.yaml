@@ -5,8 +5,8 @@ services:
     plan: starter  # Free tier
     region: oregon  # Choose closest to you: oregon, frankfurt, ohio, singapore
     schedule: "*/15 * * * *"  # Every 15 minutes
-    buildCommand: pip install -r requirements.txt
-    startCommand: pip install -r requirements.txt && python app.py --execute --limit 10
+    buildCommand: pip3 install -r requirements.txt
+    startCommand: python3 app.py --execute --limit 10
     envVars:
       - key: API_KEY
         sync: false  # Set manually in Render dashboard
