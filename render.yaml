@@ -2,6 +2,7 @@ services:
   - type: cron
     name: tweet-deleter
     runtime: python
+    pythonVersion: 3.12.0
     plan: starter  # Free tier
     region: oregon  # Choose closest to you: oregon, frankfurt, ohio, singapore
     schedule: "*/15 * * * *"  # Every 15 minutes
