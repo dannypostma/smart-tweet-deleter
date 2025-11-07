@@ -1,0 +1,511 @@
+import os
+import json
+import time
+import tweepy
+import argparse
+import requests
+import base64
+from io import BytesIO
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+from openai import OpenAI
+from PIL import Image
+
+load_dotenv()
+
+# API Credentials
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+BEARER_TOKEN = os.getenv("BEARER_TOKEN")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Configuration
+STATE_FILE = "deletion_state.json"
+DECISIONS_FILE = "deletion_decisions.json"
+MAX_TWEETS_PER_RUN = 10  # Basic tier: 5 deletes per 15 mins, analyze more than we delete
+DELAY_BETWEEN_DELETES = 2
+PRE_2019_CUTOFF = datetime(2019, 1, 1, tzinfo=timezone.utc)
+
+# Initialize OpenAI
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+class ContentAnalyzer:
+    """Analyzes tweet content using OpenAI GPT-4V"""
+
+    def __init__(self):
+        self.client = openai_client
+
+    def analyze_tweet(self, tweet_text, image_urls=None):
+        """
+        Analyze tweet text and images to determine if it should be deleted
+        Returns: {decision: DELETE/KEEP, confidence: float, reason: str, keywords: list}
+        """
+
+        prompt = f"""You are analyzing a tweet to determine if it should be deleted.
+
+DELETE if the tweet:
+- Mentions Bali, Indonesia, or any Indonesian cities/locations (Ubud, Canggu, Jakarta, etc.)
+- Shows or mentions work activities: working, building, shipping, coding, developing,
+  launching, crafting, presenting, posting updates, creating, designing, programming
+- Contains images of: laptops, workspaces, coding screens, meetings, presentations,
+  office setups, work equipment
+- Combines any location with work activity
+- Shows someone working or being productive
+
+KEEP if the tweet:
+- Is purely personal (food, travel without work context, social activities)
+- Mentions other locations (not Indonesia/Bali)
+- Contains no work indicators
+- Is about hobbies, entertainment, or leisure
+
+Tweet text: "{tweet_text}"
+Number of images: {len(image_urls) if image_urls else 0}
+
+Analyze carefully and respond in JSON format:
+{{
+  "decision": "DELETE" or "KEEP",
+  "confidence": 0.0-1.0,
+  "reason": "brief explanation",
+  "detected_keywords": ["keyword1", "keyword2"]
+}}"""
+
+        try:
+            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+
+            # Add images if present
+            if image_urls:
+                for img_url in image_urls[:4]:  # Max 4 images
+                    try:
+                        # Download and encode image
+                        response = requests.get(img_url, timeout=10)
+                        if response.status_code == 200:
+                            img = Image.open(BytesIO(response.content))
+                            # Resize if too large (max 2000x2000)
+                            if img.width > 2000 or img.height > 2000:
+                                img.thumbnail((2000, 2000))
+
+                            # Convert to base64
+                            buffered = BytesIO()
+                            img.save(buffered, format="PNG")
+                            img_base64 = base64.b64encode(buffered.getvalue()).decode()
+
+                            messages[0]["content"].append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{img_base64}"
+                                }
+                            })
+                    except Exception as e:
+                        print(f"⚠️  Failed to download image {img_url}: {e}")
+
+            # Call OpenAI API
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",  # Cost-effective model
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_tokens=500
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            return result
+
+        except Exception as e:
+            print(f"❌ OpenAI API error: {e}")
+            # Fallback to keyword-based detection
+            return self._fallback_analysis(tweet_text)
+
+    def _fallback_analysis(self, text):
+        """Fallback keyword-based analysis if OpenAI fails"""
+        text_lower = text.lower()
+
+        # Check for Bali/Indonesia mentions
+        location_keywords = ['bali', 'indonesia', 'ubud', 'canggu', 'jakarta', 'seminyak']
+        has_location = any(kw in text_lower for kw in location_keywords)
+
+        # Check for work mentions
+        work_keywords = ['work', 'build', 'ship', 'code', 'develop', 'launch',
+                         'craft', 'present', 'post', 'create', 'design', 'program']
+        has_work = any(kw in text_lower for kw in work_keywords)
+
+        if has_location or has_work:
+            return {
+                "decision": "DELETE",
+                "confidence": 0.8,
+                "reason": f"Keyword match: {'location' if has_location else 'work'}",
+                "detected_keywords": [kw for kw in (location_keywords + work_keywords) if kw in text_lower]
+            }
+
+        return {
+            "decision": "KEEP",
+            "confidence": 0.6,
+            "reason": "No obvious red flags (fallback analysis)",
+            "detected_keywords": []
+        }
+
+
+class StateManager:
+    """Manages state and decision logging"""
+
+    def __init__(self):
+        self.state = self.load_state()
+        self.decisions = self.load_decisions()
+
+    def load_state(self):
+        """Load state from file"""
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f)
+        return {
+            "total_deleted": 0,
+            "total_kept": 0,
+            "total_analyzed": 0,
+            "last_run": None,
+            "last_analyzed_tweet_id": None
+        }
+
+    def load_decisions(self):
+        """Load decision log from file"""
+        if os.path.exists(DECISIONS_FILE):
+            with open(DECISIONS_FILE, 'r') as f:
+                return json.load(f)
+        return {
+            "decisions": [],
+            "stats": {
+                "total_analyzed": 0,
+                "marked_for_deletion": 0,
+                "actually_deleted": 0,
+                "kept": 0
+            }
+        }
+
+    def save_state(self):
+        """Save state to file"""
+        self.state["last_run"] = datetime.now().isoformat()
+        with open(STATE_FILE, 'w') as f:
+            json.dump(self.state, f, indent=2)
+
+    def save_decisions(self):
+        """Save decisions to file"""
+        with open(DECISIONS_FILE, 'w') as f:
+            json.dump(self.decisions, f, indent=2)
+
+    def log_decision(self, tweet, decision, reason, ai_analysis, deleted=False):
+        """Log a decision"""
+        self.decisions["decisions"].append({
+            "tweet_id": str(tweet.id),
+            "text": tweet.full_text[:200],  # Truncate long tweets
+            "created_at": tweet.created_at.isoformat(),
+            "decision": decision,
+            "reason": reason,
+            "ai_analysis": ai_analysis,
+            "has_images": bool(hasattr(tweet, 'entities') and 'media' in tweet.entities),
+            "has_video": self._has_video(tweet),
+            "is_reply": bool(tweet.in_reply_to_status_id),
+            "is_retweet": hasattr(tweet, 'retweeted_status'),
+            "deleted": deleted,
+            "deleted_at": datetime.now().isoformat() if deleted else None
+        })
+
+        # Update stats
+        self.decisions["stats"]["total_analyzed"] += 1
+        if decision == "DELETE":
+            self.decisions["stats"]["marked_for_deletion"] += 1
+            if deleted:
+                self.decisions["stats"]["actually_deleted"] += 1
+        else:
+            self.decisions["stats"]["kept"] += 1
+
+        self.state["total_analyzed"] += 1
+        if deleted:
+            self.state["total_deleted"] += 1
+        elif decision == "KEEP":
+            self.state["total_kept"] += 1
+
+    def _has_video(self, tweet):
+        """Check if tweet has video"""
+        if hasattr(tweet, 'extended_entities') and 'media' in tweet.extended_entities:
+            for media in tweet.extended_entities['media']:
+                if media['type'] in ['video', 'animated_gif']:
+                    return True
+        return False
+
+    def was_analyzed(self, tweet_id):
+        """Check if tweet was already analyzed"""
+        return any(d['tweet_id'] == str(tweet_id) for d in self.decisions["decisions"])
+
+
+class DeletionDecider:
+    """Makes deletion decisions based on rules and AI analysis"""
+
+    def __init__(self, analyzer, my_user_id):
+        self.analyzer = analyzer
+        self.my_user_id = my_user_id
+
+    def should_delete(self, tweet):
+        """
+        Determine if tweet should be deleted
+        Returns: (should_delete: bool, reason: str, ai_analysis: dict)
+        """
+
+        # Rule 1: Pre-2019 tweets - auto delete
+        if tweet.created_at < PRE_2019_CUTOFF:
+            return True, "Pre-2019 tweet (auto-delete)", {"decision": "DELETE", "confidence": 1.0}
+
+        # Rule 2: Videos - auto delete
+        if self._has_video(tweet):
+            return True, "Contains video (auto-delete)", {"decision": "DELETE", "confidence": 1.0}
+
+        # Rule 3: Replies to others - auto delete (keep only self-replies)
+        if tweet.in_reply_to_status_id and tweet.in_reply_to_user_id != self.my_user_id:
+            return True, "Reply to another user (auto-delete)", {"decision": "DELETE", "confidence": 1.0}
+
+        # Rule 4: Retweets - auto delete
+        if hasattr(tweet, 'retweeted_status'):
+            return True, "Retweet (auto-delete)", {"decision": "DELETE", "confidence": 1.0}
+
+        # Rule 5: AI Analysis for original tweets and self-replies
+        image_urls = self._extract_image_urls(tweet)
+        ai_analysis = self.analyzer.analyze_tweet(tweet.full_text, image_urls)
+
+        # Delete if confidence >= 0.5 and decision is DELETE
+        if ai_analysis['decision'] == 'DELETE' and ai_analysis['confidence'] >= 0.5:
+            return True, f"AI: {ai_analysis['reason']}", ai_analysis
+
+        return False, f"AI: {ai_analysis['reason']}", ai_analysis
+
+    def _has_video(self, tweet):
+        """Check if tweet has video"""
+        if hasattr(tweet, 'extended_entities') and 'media' in tweet.extended_entities:
+            for media in tweet.extended_entities['media']:
+                if media['type'] in ['video', 'animated_gif']:
+                    return True
+        return False
+
+    def _extract_image_urls(self, tweet):
+        """Extract image URLs from tweet"""
+        image_urls = []
+        if hasattr(tweet, 'extended_entities') and 'media' in tweet.extended_entities:
+            for media in tweet.extended_entities['media']:
+                if media['type'] == 'photo':
+                    image_urls.append(media['media_url_https'])
+        return image_urls
+
+
+class TweetDeleter:
+    """Main orchestrator for tweet deletion"""
+
+    def __init__(self, dry_run=True):
+        self.dry_run = dry_run
+
+        # Authenticate with Twitter v1.1 (for delete operations)
+        auth = tweepy.OAuth1UserHandler(
+            API_KEY, API_SECRET,
+            ACCESS_TOKEN, ACCESS_TOKEN_SECRET
+        )
+        self.api = tweepy.API(auth, wait_on_rate_limit=True)
+
+        # Authenticate with Twitter v2 (for fetching tweets)
+        self.client = tweepy.Client(
+            bearer_token=BEARER_TOKEN,
+            consumer_key=API_KEY,
+            consumer_secret=API_SECRET,
+            access_token=ACCESS_TOKEN,
+            access_token_secret=ACCESS_TOKEN_SECRET,
+            wait_on_rate_limit=True
+        )
+
+        # Get user info
+        me_v2 = self.client.get_me()
+        self.my_user_id = me_v2.data.id
+        self.username = me_v2.data.username
+
+        # Initialize components
+        self.analyzer = ContentAnalyzer()
+        self.decider = DeletionDecider(self.analyzer, self.my_user_id)
+        self.state_manager = StateManager()
+
+    def run(self, limit=MAX_TWEETS_PER_RUN):
+        """Main execution loop"""
+        print("="*60)
+        print(f"🧹 Selective Tweet Deleter for @{self.username}")
+        print(f"   Mode: {'DRY RUN (no deletions)' if self.dry_run else 'EXECUTE (will delete)'}")
+        print("="*60)
+        print(f"\n📊 Stats so far:")
+        print(f"   Analyzed: {self.state_manager.state['total_analyzed']}")
+        print(f"   Deleted: {self.state_manager.state['total_deleted']}")
+        print(f"   Kept: {self.state_manager.state['total_kept']}")
+
+        print(f"\n📥 Fetching up to {limit} tweets...")
+
+        try:
+            # Fetch tweets using v2 API (newest first)
+            # v2 API requires min 5, max 100 results per request
+            max_results = max(5, min(limit, 100))
+            response = self.client.get_users_tweets(
+                id=self.my_user_id,
+                max_results=max_results,
+                tweet_fields=['created_at', 'text', 'attachments', 'referenced_tweets', 'in_reply_to_user_id'],
+                expansions=['attachments.media_keys'],
+                media_fields=['type', 'url', 'preview_image_url']
+            )
+
+            if not response.data:
+                print("✅ No more tweets to process!")
+                return
+
+            tweets = response.data
+            media_dict = {}
+            if response.includes and 'media' in response.includes:
+                media_dict = {m.media_key: m for m in response.includes['media']}
+
+            print(f"📋 Found {len(tweets)} tweets to analyze\n")
+
+            analyzed_count = 0
+            deleted_count = 0
+            kept_count = 0
+
+            for tweet in tweets:
+                # Skip if already analyzed
+                if self.state_manager.was_analyzed(tweet.id):
+                    print(f"⏭️  Skipping already analyzed tweet {tweet.id}")
+                    continue
+
+                analyzed_count += 1
+
+                # Adapt v2 tweet to v1-like structure for compatibility
+                tweet_adapted = self._adapt_v2_tweet(tweet, media_dict)
+
+                # Make decision
+                should_delete, reason, ai_analysis = self.decider.should_delete(tweet_adapted)
+
+                tweet_preview = tweet.text[:60].replace('\n', ' ')
+                date_str = tweet.created_at.strftime("%Y-%m-%d")
+
+                if should_delete:
+                    deleted_count += 1
+                    decision_emoji = "🗑️ "
+
+                    # Actually delete if not dry run
+                    actually_deleted = False
+                    if not self.dry_run:
+                        try:
+                            self.api.destroy_status(tweet.id)
+                            actually_deleted = True
+                            print(f"{decision_emoji} DELETED [{date_str}]: {tweet_preview}...")
+                            print(f"   Reason: {reason}")
+                            time.sleep(DELAY_BETWEEN_DELETES)
+                        except tweepy.errors.TweepyException as e:
+                            print(f"❌ Failed to delete: {e}")
+                    else:
+                        print(f"{decision_emoji} WOULD DELETE [{date_str}]: {tweet_preview}...")
+                        print(f"   Reason: {reason}")
+
+                    self.state_manager.log_decision(
+                        tweet_adapted, "DELETE", reason, ai_analysis, actually_deleted
+                    )
+                else:
+                    kept_count += 1
+                    print(f"✅ KEEPING [{date_str}]: {tweet_preview}...")
+                    print(f"   Reason: {reason}")
+
+                    self.state_manager.log_decision(
+                        tweet_adapted, "KEEP", reason, ai_analysis, False
+                    )
+
+                print()  # Blank line between tweets
+
+            # Summary
+            print("="*60)
+            print(f"✨ Summary for this run:")
+            print(f"   Analyzed: {analyzed_count}")
+            print(f"   Would delete: {deleted_count}")
+            print(f"   Keeping: {kept_count}")
+            if not self.dry_run:
+                print(f"   Actually deleted: {deleted_count}")
+            print("="*60)
+
+        except tweepy.errors.TweepyException as e:
+            print(f"❌ Twitter API Error: {e}")
+        finally:
+            # Save state
+            self.state_manager.save_state()
+            self.state_manager.save_decisions()
+            print(f"\n💾 Progress saved to {STATE_FILE} and {DECISIONS_FILE}")
+
+    def _adapt_v2_tweet(self, tweet_v2, media_dict):
+        """Convert v2 tweet format to v1-like structure for compatibility"""
+        class AdaptedTweet:
+            def __init__(self, v2_tweet, media_dict):
+                self.id = v2_tweet.id
+                self.full_text = v2_tweet.text
+                self.created_at = v2_tweet.created_at
+                self.in_reply_to_status_id = None
+                self.in_reply_to_user_id = getattr(v2_tweet, 'in_reply_to_user_id', None)
+
+                # Check for retweet
+                if hasattr(v2_tweet, 'referenced_tweets') and v2_tweet.referenced_tweets:
+                    for ref in v2_tweet.referenced_tweets:
+                        if ref.type == 'retweeted':
+                            self.retweeted_status = True
+                            break
+                        elif ref.type == 'replied_to':
+                            self.in_reply_to_status_id = ref.id
+
+                # Handle media
+                self.extended_entities = {}
+                if hasattr(v2_tweet, 'attachments') and v2_tweet.attachments and 'media_keys' in v2_tweet.attachments:
+                    media_list = []
+                    for media_key in v2_tweet.attachments['media_keys']:
+                        if media_key in media_dict:
+                            media_obj = media_dict[media_key]
+                            media_list.append({
+                                'type': media_obj.type,
+                                'media_url_https': getattr(media_obj, 'url', None)
+                            })
+                    if media_list:
+                        self.extended_entities['media'] = media_list
+
+        return AdaptedTweet(tweet_v2, media_dict)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Selective Tweet Deleter')
+    parser.add_argument(
+        '--execute',
+        action='store_true',
+        help='Execute deletions (default is dry-run)'
+    )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=MAX_TWEETS_PER_RUN,
+        help=f'Number of tweets to process (default: {MAX_TWEETS_PER_RUN})'
+    )
+
+    args = parser.parse_args()
+
+    if not OPENAI_API_KEY:
+        print("❌ Error: OPENAI_API_KEY not found in .env file")
+        return
+
+    if not args.execute:
+        print("\n⚠️  DRY RUN MODE - No tweets will be deleted")
+        print("   Use --execute to actually delete tweets\n")
+
+    deleter = TweetDeleter(dry_run=not args.execute)
+    deleter.run(limit=args.limit)
+
+    print("\n" + "="*60)
+    if args.execute:
+        print("✨ Done! Run again to process more tweets.")
+    else:
+        print("✨ Dry run complete! Review decisions in deletion_decisions.json")
+        print("   Run with --execute to actually delete tweets")
+    print("="*60)
+
+
+if __name__ == "__main__":
+    main()

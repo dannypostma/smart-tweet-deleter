@@ -1,0 +1,22 @@
+services:
+  - type: cron
+    name: tweet-deleter
+    runtime: python
+    plan: starter  # Free tier
+    region: oregon  # Choose closest to you: oregon, frankfurt, ohio, singapore
+    schedule: "*/15 * * * *"  # Every 15 minutes
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3.9 app.py --execute --limit 10
+    envVars:
+      - key: API_KEY
+        sync: false  # Set manually in Render dashboard
+      - key: API_SECRET
+        sync: false
+      - key: BEARER_TOKEN
+        sync: false
+      - key: ACCESS_TOKEN
+        sync: false
+      - key: ACCESS_TOKEN_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
