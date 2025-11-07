@@ -60,6 +60,7 @@ DELETE if the tweet:
   office setups, work equipment
 - Combines any location with work activity
 - Shows someone working or being productive
+- Mentions HeadshotPro, course creation, or online business activities
 
 KEEP if the tweet:
 - Is purely personal (food, travel without work context, social activities)
