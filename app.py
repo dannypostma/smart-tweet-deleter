@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image
 from pymongo import MongoClient
+from utils.storage_manager import CloudflareR2Storage, StorageUploadError
 
 load_dotenv()
 
@@ -31,8 +32,15 @@ PRE_2019_CUTOFF = datetime(2019, 1, 1, tzinfo=timezone.utc)
 # MongoDB Setup
 mongo_client = MongoClient(DATABASE_URL)
 db = mongo_client.get_default_database()
-state_collection = db["state"]
-decisions_collection = db["decisions"]
+
+# Use -dev suffix for collections in development to avoid interfering with live data
+NODE_ENV = os.getenv("NODE_ENV", "production")
+collection_suffix = "-dev" if NODE_ENV == "development" else ""
+state_collection = db[f"state{collection_suffix}"]
+decisions_collection = db[f"decisions{collection_suffix}"]
+
+if NODE_ENV == "development":
+    print("⚠️  Development mode: Using -dev collections")
 
 # Initialize OpenAI
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -189,7 +197,7 @@ class StateManager:
         """Update pagination token in state"""
         self.state["pagination_token"] = token
 
-    def log_decision(self, tweet, decision, reason, ai_analysis, deleted=False):
+    def log_decision(self, tweet, decision, reason, ai_analysis, deleted=False, media_uploads=None):
         """Log a decision to MongoDB"""
         decision_doc = {
             "tweet_id": str(tweet.id),
@@ -204,7 +212,8 @@ class StateManager:
             "is_retweet": hasattr(tweet, 'retweeted_status'),
             "deleted": deleted,
             "deleted_at": datetime.now().isoformat() if deleted else None,
-            "analyzed_at": datetime.now().isoformat()
+            "analyzed_at": datetime.now().isoformat(),
+            "media_uploads": media_uploads or []
         }
 
         # Insert decision into MongoDB
@@ -286,6 +295,46 @@ class DeletionDecider:
                     image_urls.append(media['media_url_https'])
         return image_urls
 
+    def _extract_video_urls(self, tweet):
+        """Extract video URLs from tweet"""
+        video_urls = []
+        if hasattr(tweet, 'extended_entities') and 'media' in tweet.extended_entities:
+            for media in tweet.extended_entities['media']:
+                if media['type'] in ['video', 'animated_gif']:
+                    # Get highest quality video variant
+                    if 'video_info' in media and 'variants' in media['video_info']:
+                        # Filter for mp4 variants and sort by bitrate
+                        mp4_variants = [v for v in media['video_info']['variants'] if v.get('content_type') == 'video/mp4']
+                        if mp4_variants:
+                            # Sort by bitrate (highest first)
+                            best_variant = max(mp4_variants, key=lambda v: v.get('bitrate', 0))
+                            video_urls.append(best_variant['url'])
+        return video_urls
+
+    def _extract_all_media(self, tweet):
+        """
+        Extract all media (images and videos) from tweet
+        Returns: list of dicts with {type: 'photo'|'video', url: str}
+        """
+        media_items = []
+        if hasattr(tweet, 'extended_entities') and 'media' in tweet.extended_entities:
+            for media in tweet.extended_entities['media']:
+                if media['type'] == 'photo':
+                    media_items.append({
+                        'type': 'photo',
+                        'url': media['media_url_https']
+                    })
+                elif media['type'] in ['video', 'animated_gif']:
+                    if 'video_info' in media and 'variants' in media['video_info']:
+                        mp4_variants = [v for v in media['video_info']['variants'] if v.get('content_type') == 'video/mp4']
+                        if mp4_variants:
+                            best_variant = max(mp4_variants, key=lambda v: v.get('bitrate', 0))
+                            media_items.append({
+                                'type': 'video',
+                                'url': best_variant['url']
+                            })
+        return media_items
+
 
 class TweetDeleter:
     """Main orchestrator for tweet deletion"""
@@ -319,6 +368,15 @@ class TweetDeleter:
         self.analyzer = ContentAnalyzer()
         self.decider = DeletionDecider(self.analyzer, self.my_user_id)
         self.state_manager = StateManager()
+
+        # Initialize Cloudflare R2 storage (optional - only if credentials are set)
+        self.storage = None
+        try:
+            self.storage = CloudflareR2Storage()
+            print(f"✅ Cloudflare R2 storage initialized")
+        except (ValueError, Exception) as e:
+            print(f"⚠️  Cloudflare R2 not configured: {e}")
+            print(f"   Media will not be uploaded. Set CLOUDFLARE_* env vars to enable.")
 
     def run(self, limit=MAX_TWEETS_PER_RUN):
         """Main execution loop"""
@@ -388,6 +446,16 @@ class TweetDeleter:
                 # Adapt v2 tweet to v1-like structure for compatibility
                 tweet_adapted = self._adapt_v2_tweet(tweet, media_dict)
 
+                # Extract and upload media (skip replies to other people)
+                uploaded_media = []
+                is_reply_to_other = tweet_adapted.in_reply_to_status_id and tweet_adapted.in_reply_to_user_id != self.my_user_id
+
+                if not is_reply_to_other:
+                    media_items = self.decider._extract_all_media(tweet_adapted)
+                    if media_items:
+                        print(f"📸 Found {len(media_items)} media item(s) in tweet {tweet.id}")
+                        uploaded_media = self._upload_tweet_media(tweet_adapted, media_items)
+
                 # Make decision
                 should_delete, reason, ai_analysis = self.decider.should_delete(tweet_adapted)
 
@@ -414,7 +482,7 @@ class TweetDeleter:
                         print(f"   Reason: {reason}")
 
                     self.state_manager.log_decision(
-                        tweet_adapted, "DELETE", reason, ai_analysis, actually_deleted
+                        tweet_adapted, "DELETE", reason, ai_analysis, actually_deleted, uploaded_media
                     )
                 else:
                     kept_count += 1
@@ -422,7 +490,7 @@ class TweetDeleter:
                     print(f"   Reason: {reason}")
 
                     self.state_manager.log_decision(
-                        tweet_adapted, "KEEP", reason, ai_analysis, False
+                        tweet_adapted, "KEEP", reason, ai_analysis, False, uploaded_media
                     )
 
                 print()  # Blank line between tweets
@@ -488,6 +556,81 @@ class TweetDeleter:
                         self.extended_entities['media'] = media_list
 
         return AdaptedTweet(tweet_v2, media_dict)
+
+    def _download_media(self, url, timeout=30):
+        """
+        Download media from URL
+        Returns: bytes or None if failed
+        """
+        try:
+            response = requests.get(url, timeout=timeout)
+            if response.status_code == 200:
+                return response.content
+            else:
+                print(f"⚠️  Failed to download media: HTTP {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"⚠️  Failed to download media from {url}: {e}")
+            return None
+
+    def _upload_tweet_media(self, tweet, media_items):
+        """
+        Upload all media from a tweet to Cloudflare R2
+        Returns: list of dicts with upload metadata
+        """
+        if not self.storage:
+            return []
+
+        uploaded_media = []
+        tweet_id = tweet.id
+
+        for idx, media_item in enumerate(media_items):
+            media_type = media_item['type']
+            media_url = media_item['url']
+
+            # Download media
+            print(f"📥 Downloading {media_type} {idx+1}/{len(media_items)} from tweet {tweet_id}...")
+            media_bytes = self._download_media(media_url)
+
+            if not media_bytes:
+                print(f"⚠️  Skipping upload - download failed")
+                continue
+
+            # Determine file extension and content type
+            if media_type == 'photo':
+                extension = 'jpg'
+                content_type = 'image/jpeg'
+            else:  # video
+                extension = 'mp4'
+                content_type = 'video/mp4'
+
+            # Generate object key with username/tweets/tweet_id/filename structure
+            filename = f"{media_type}_{idx}.{extension}"
+            object_key = f"{self.username}/tweets/{tweet_id}/{filename}"
+
+            # Upload to R2
+            try:
+                upload_result = self.storage.upload_bytes(
+                    media_bytes,
+                    object_key,
+                    content_type=content_type
+                )
+
+                uploaded_media.append({
+                    'type': media_type,
+                    'object_path': upload_result['object_path'],
+                    'deeplink': upload_result['deeplink'],
+                    'content_type': upload_result['content_type'],
+                    'file_size': upload_result['file_size']
+                })
+
+                print(f"✅ Uploaded {media_type} to: {upload_result['object_path']}")
+
+            except StorageUploadError as e:
+                print(f"❌ Failed to upload {media_type}: {e}")
+                continue
+
+        return uploaded_media
 
 
 def main():

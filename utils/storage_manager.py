@@ -2,16 +2,24 @@
 Cloud storage manager for uploading files.
 """
 import os
+import uuid
+import datetime
 import boto3
 
-class StorageError(FluxInferenceError):
+
+class StorageError(Exception):
     """Base exception for storage-related errors."""
+    pass
+
+
+class StorageUploadError(StorageError):
+    """Exception raised when upload fails."""
     pass
 
 class CloudflareR2Storage:
     """Manages file uploads to Cloudflare R2 storage."""
 
-    def __init__(self, account_id=None, access_key_id=None, secret_access_key=None, bucket_name=None):
+    def __init__(self, account_id=None, access_key_id=None, secret_access_key=None, bucket_name=None, public_url=None):
         """
         Initialize R2 storage client.
 
@@ -20,11 +28,13 @@ class CloudflareR2Storage:
             access_key_id: Cloudflare access key ID (defaults to env var CLOUDFLARE_ACCESS_KEY_ID)
             secret_access_key: Cloudflare secret access key (defaults to env var CLOUDFLARE_SECRET_ACCESS_KEY)
             bucket_name: R2 bucket name (defaults to env var or "headshotpro-temporary-files")
+            public_url: Public URL for R2 bucket (defaults to env var CLOUDFLARE_PUBLIC_URL)
         """
         self.account_id = account_id or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
         self.access_key_id = access_key_id or os.environ.get("CLOUDFLARE_ACCESS_KEY_ID")
         self.secret_access_key = secret_access_key or os.environ.get("CLOUDFLARE_SECRET_ACCESS_KEY")
         self.bucket_name = bucket_name or os.environ.get("CLOUDFLARE_R2_BUCKET", "headshotpro-temporary-files")
+        self.public_url = public_url or os.environ.get("CLOUDFLARE_PUBLIC_URL", "")
 
         if not all([self.account_id, self.access_key_id, self.secret_access_key]):
             raise ValueError("Cloudflare R2 credentials not provided")
@@ -51,7 +61,7 @@ class CloudflareR2Storage:
             content_type: MIME type of the file (default: 'image/jpeg')
 
         Returns:
-            dict: File metadata including url, content_type, file_name, and file_size
+            dict: File metadata including object_path, deeplink, content_type, file_name, and file_size
 
         Raises:
             StorageUploadError: If upload fails
@@ -71,10 +81,14 @@ class CloudflareR2Storage:
             # Extract filename from object_key
             file_name = object_key.split('/')[-1]
 
+            # Generate deeplink (full public URL)
+            deeplink = self._generate_deeplink(object_key)
+
             print(f"✅ Uploaded successfully: {object_key}")
 
             return {
-                "url": object_key,
+                "object_path": object_key,
+                "deeplink": deeplink,
                 "content_type": content_type,
                 "file_name": file_name,
                 "file_size": len(file_bytes)
@@ -84,6 +98,24 @@ class CloudflareR2Storage:
             error_msg = f"Failed to upload to Cloudflare R2: {str(e)}"
             print(f"❌ {error_msg}")
             raise StorageUploadError(error_msg) from e
+
+    def _generate_deeplink(self, object_key):
+        """
+        Generate public URL for an object.
+
+        Args:
+            object_key: Storage path/key for the object
+
+        Returns:
+            str: Full public URL
+        """
+        if self.public_url:
+            # Remove trailing slash from public_url if present
+            base_url = self.public_url.rstrip('/')
+            return f"{base_url}/{object_key}"
+        else:
+            # Fallback to object_key if no public URL configured
+            return object_key
 
     def upload_image(self, image_bytes, prefix="modal/flux-images", extension="jpg"):
         """
@@ -95,10 +127,25 @@ class CloudflareR2Storage:
             extension: File extension (default: "jpg")
 
         Returns:
-            dict: File metadata including url, content_type, file_name, and file_size
+            dict: File metadata including object_path, deeplink, content_type, file_name, and file_size
         """
         object_key = generate_object_key(prefix=prefix, extension=extension)
         return self.upload_bytes(image_bytes, object_key, content_type='image/jpeg')
+
+    def upload_video(self, video_bytes, prefix="modal/videos", extension="mp4"):
+        """
+        Upload video bytes with auto-generated filename.
+
+        Args:
+            video_bytes: Video data as bytes
+            prefix: Storage path prefix (default: "modal/videos")
+            extension: File extension (default: "mp4")
+
+        Returns:
+            dict: File metadata including object_path, deeplink, content_type, file_name, and file_size
+        """
+        object_key = generate_object_key(prefix=prefix, extension=extension)
+        return self.upload_bytes(video_bytes, object_key, content_type='video/mp4')
 
 
 def generate_object_key(prefix="modal/flux-images", extension="jpg"):
