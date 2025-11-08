@@ -455,6 +455,8 @@ class TweetDeleter:
                     if media_items:
                         print(f"📸 Found {len(media_items)} media item(s) in tweet {tweet.id}")
                         uploaded_media = self._upload_tweet_media(tweet_adapted, media_items)
+                    else:
+                        print(f"⏭️  No media found in tweet {tweet.id} - skipping backup")
 
                 # Make decision
                 should_delete, reason, ai_analysis = self.decider.should_delete(tweet_adapted)
