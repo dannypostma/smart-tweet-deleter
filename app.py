@@ -6,7 +6,7 @@ import argparse
 import requests
 import base64
 from io import BytesIO
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image
@@ -28,6 +28,7 @@ DATABASE_URL = os.getenv("DATABASEURL")
 MAX_TWEETS_PER_RUN = 10  # Basic tier: 5 deletes per 15 mins, analyze more than we delete
 DELAY_BETWEEN_DELETES = 2
 PRE_2019_CUTOFF = datetime(2019, 1, 1, tzinfo=timezone.utc)
+SKIP_RECENT_DAYS = 3  # Skip tweets newer than this many days
 
 # MongoDB Setup
 mongo_client = MongoClient(DATABASE_URL)
@@ -440,6 +441,12 @@ class TweetDeleter:
                 # Skip if already analyzed
                 if self.state_manager.was_analyzed(tweet.id):
                     print(f"⏭️  Skipping already analyzed tweet {tweet.id}")
+                    continue
+
+                # Skip tweets that are too recent
+                tweet_age = datetime.now(timezone.utc) - tweet.created_at
+                if tweet_age.days < SKIP_RECENT_DAYS:
+                    print(f"⏭️  Skipping recent tweet {tweet.id} ({tweet_age.days} days old, waiting {SKIP_RECENT_DAYS} days)")
                     continue
 
                 analyzed_count += 1
